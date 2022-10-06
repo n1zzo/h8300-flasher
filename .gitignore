@@ -50,3 +50,12 @@ modules.order
 Module.symvers
 Mkfile.old
 dkms.conf
+
+# Build files
+h8300-flasher
+
+# Vim tags
+tags
+
+# GDB
+.gdb_history
