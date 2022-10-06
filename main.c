@@ -17,6 +17,8 @@
         }                                    \
     } while(0)
 
+#define PACK __attribute__((__packed__))
+
 #define BULK_EP_IN   0x82
 #define BULK_EP_OUT  0x01
 
@@ -40,7 +42,7 @@
  * **************************************************************************/
 
 // Supported device inquiry response
-struct dev_inq_hdr_t {
+struct PACK dev_inq_hdr_t {
     uint8_t cmd;
     uint8_t size;
     uint8_t ndev;
@@ -48,15 +50,60 @@ struct dev_inq_hdr_t {
     char code[4];
 };
 
-struct dev_sel_t {
+struct PACK dev_sel_t {
     uint8_t cmd;
     uint8_t size;
     char code[4];
     uint8_t sum;
 };
 
-int main() {
+struct PACK prog_chunk_t {
+    uint8_t cmd;
+    uint32_t addr;
+    uint8_t data[1024];
+    uint8_t sum;
+};
+
+struct PACK prog_end_t {
+    uint8_t cmd;
+    uint32_t addr;
+    uint8_t sum;
+};
+
+struct PACK sum_chk_t {
+    uint8_t cmd;
+    uint8_t size;
+    uint32_t chk;
+    uint8_t sum;
+};
+
+uint8_t checksum(uint8_t *data, size_t len) {
+    uint8_t sum = 0;
+    for (int i = 0; i < len; i++) {
+        sum += data[i];
+    }
+    sum = ~sum;
+    sum++;
+    return sum;
+}
+
+int main(int argc, char *argv[]) {
     struct libusb_device_handle *dh = NULL;
+
+    // Open firmware file
+    if(argc < 2) {
+        fprintf(stderr, "Error: no binary file provided!\n");
+        printf("Usage: ./j8300-flasher BINFILE\n");
+        exit(-1);
+    }
+    FILE *binfile = fopen(argv[1], "rb");
+    if (!binfile)
+        perror("Error: ");
+
+    // Compute binary file size
+    fseek(binfile, 0, SEEK_END);
+    long binsize = ftell(binfile);
+    fseek(binfile, 0, SEEK_SET);
 
     // Init libusb
     int err = 0;
@@ -177,13 +224,7 @@ int main() {
     sel.size = 4;
     for (int i = 0; i < 4; i++)
         sel.code[i] = dir->code[i];
-    for (int i = 0; i < sizeof(sel) - 1; i++) {
-        sel.sum += ((char *) &sel)[i];
-        //printf("0x%1X ", ((char *)&sel)[i]);
-    }
-    sel.sum = ~sel.sum;
-    sel.sum += 1;
-    //printf("0x%1X ", sel.sum);
+    sel.sum = checksum((uint8_t *) &sel, sizeof(sel) - 1);
     err = libusb_bulk_transfer(dh,
                                BULK_EP_OUT,
                                (char *) &sel,
@@ -219,7 +260,6 @@ int main() {
                                &received,
                                0);
     CHECK_ERR("error during clock mode inquiry!");
-    // TODO: parse
     printf("Supported clock modes:\n");
     for (int i = 0; i < received; i++)
         printf("0x%1X ", buf[i]);
@@ -270,7 +310,6 @@ int main() {
                                &received,
                                0);
     CHECK_ERR("error during programming mode inquiry!");
-    // TODO: parse
     printf("Supported programming units:\n");
     for (int i = 0; i < received; i++)
         printf("0x%1X ", buf[i]);
@@ -311,7 +350,7 @@ int main() {
                                BULK_EP_OUT,
                                &cmd,
                                1,
-                               &received,
+                               &transferred,
                                0);
     CHECK_ERR("error during bit rate confirmation!");
     // Expected response 0x06 <- (ACK)
@@ -332,7 +371,7 @@ int main() {
                                BULK_EP_OUT,
                                &cmd,
                                1,
-                               &received,
+                               &transferred,
                                0);
     CHECK_ERR("error during transition to programming state!");
     // Expected response 0x06 <- (ACK)
@@ -353,7 +392,7 @@ int main() {
                                BULK_EP_OUT,
                                &cmd,
                                1,
-                               &received,
+                               &transferred,
                                0);
     CHECK_ERR("error during user MAT programming selection!");
     // Expected response 0x06 <- (ACK)
@@ -368,9 +407,84 @@ int main() {
         err = -1;
     CHECK_ERR("error during user MAT programming selection!");
 
-    // TODO: 128-Byte Programming 0x50 ->
-    // TODO: Stop Programming Operation
-    // TODO: User MAT Sum Check
+    // 128-Byte Programming 0x50 ->
+    struct prog_chunk_t c = { 0 };
+    c.cmd = 0x50;
+    uint32_t bin_sum;
+    for(int i = 0; i < binsize / 1024; i++) {
+        c.addr = __builtin_bswap32(i * 1024);
+        fread(&(c.data), 1, 1024, binfile);
+        bin_sum += checksum((uint8_t *)&(c.data), 1024);
+        c.sum = checksum((uint8_t *) &c, sizeof(c) - 1);
+        err = libusb_bulk_transfer(dh,
+                                   BULK_EP_OUT,
+                                   (void *) &c,
+                                   sizeof(c),
+                                   &transferred,
+                                   0);
+        CHECK_ERR("error during programming!");
+        // Expected response 0x06 <- (ACK)
+        err = libusb_bulk_transfer(dh,
+                                   BULK_EP_IN,
+                                   buf,
+                                   sizeof(buf),
+                                   &received,
+                                   0);
+        CHECK_ERR("error during programming!");
+        if (buf[0] != 0x06)
+            err = -1;
+        CHECK_ERR("error during programming!");
+    }
+
+    // Send 1024 and then last 6
+
+    // Stop Programming Operation
+    struct prog_end_t e = { 0 };
+    e.cmd = 0x50;
+    e.addr = 0xffffffff;
+    e.sum = 0xb4;
+    err = libusb_bulk_transfer(dh,
+                               BULK_EP_OUT,
+                               (void *) &e,
+                               sizeof(e),
+                               &transferred,
+                               0);
+    CHECK_ERR("error during programming stop!");
+    // Expected response 0x06 <- (ACK)
+    err = libusb_bulk_transfer(dh,
+                               BULK_EP_IN,
+                               buf,
+                               sizeof(buf),
+                               &received,
+                               0);
+    CHECK_ERR("error during programming stop!");
+    if (buf[0] != 0x06)
+        err = -1;
+    CHECK_ERR("error during programming stop!");
+
+    // User MAT Sum Check 0x4B ->
+    cmd = 0x4B;
+    err = libusb_bulk_transfer(dh,
+                               BULK_EP_OUT,
+                               &cmd,
+                               1,
+                               &transferred,
+                               0);
+    CHECK_ERR("error during user MAT sum check!");
+    err = libusb_bulk_transfer(dh,
+                               BULK_EP_IN,
+                               buf,
+                               sizeof(buf),
+                               &received,
+                               0);
+    CHECK_ERR("error during user MAT sum check!");
+    struct sum_chk_t *chk = (struct sum_chk_t *) buf;
+    if (chk->cmd != 0x5B &&
+        chk->size != 4 &&
+        chk->sum != checksum((uint8_t *) chk, sizeof(struct sum_chk_t) - 1) &&
+        __builtin_bswap32(chk->chk) != bin_sum)
+        err = -1;
+    CHECK_ERR("error during user MAT sum check!");
 
     // Terminate transfer
     libusb_close(dh);
